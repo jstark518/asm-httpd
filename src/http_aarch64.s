@@ -3,6 +3,7 @@
 
 // ---- syscall numbers (AArch64 Linux) ----------------------------------------
 .set SYS_read,          63
+.set SYS_write,         64
 .set SYS_close,         57
 .set SYS_exit,          93
 .set SYS_socket,        198
@@ -37,13 +38,21 @@
 .set EVENT_DATA_OFF,    8
 
 .set EAGAIN,            11
+.set STDOUT,            1
+.set CH_DOT,            46
+.set CH_COLON,          58
+.set CH_SPACE,          32
+.set CH_ZERO,           48
+.set CH_CR,             13
+.set CH_LF,             10
 
 .set PORT_HI,           0x1f       // 8080 = 0x1f90, stored big-endian
 .set PORT_LO,           0x90
 .set BACKLOG,           128
-.set REQBUF_SIZE,       8192
 .set MAX_EVENTS,        64
-.set MAX_FDS,           4096       // bounds the per-connection state table
+.set MAX_FDS,           1024       // bounds the per-connection state tables
+.set CONN_BUF_SHIFT,    12
+.set CONN_BUF,          (1 << CONN_BUF_SHIFT)
 
 // -----------------------------------------------------------------------------
 .section .rodata
@@ -82,10 +91,26 @@ response:
 .section .bss
 .balign 8
 
-// Every connection reads into the same buffer. That is safe only because the
-// request is never parsed -- it is read to drain the socket and then discarded.
-reqbuf:
-        .skip   REQBUF_SIZE
+// Per-connection request buffers, indexed by fd. Headers are parsed rather than
+// discarded, and they arrive a fragment at a time interleaved with other
+// connections, so each fd needs somewhere of its own to accumulate.
+reqbufs:
+        .skip   MAX_FDS * CONN_BUF
+
+rlen:                                      // bytes buffered, per fd
+        .skip   MAX_FDS * 4
+sent:                                      // response bytes sent, per fd
+        .skip   MAX_FDS * 4
+
+// Peer address per fd, captured at accept: 4 bytes of IPv4 then 2 of port, both
+// still in network byte order.
+peers:
+        .skip   MAX_FDS * 8
+
+acceptaddr:                                // sockaddr_in filled by accept4
+        .skip   16
+acceptlen:                                 // its length, in and out
+        .skip   4
 
 events:                                    // epoll_pwait output
         .skip   MAX_EVENTS * EVENT_SIZE
@@ -93,10 +118,10 @@ events:                                    // epoll_pwait output
 ev:                                        // scratch epoll_event for _ctl
         .skip   EVENT_SIZE
 
-// Bytes of the response already sent, indexed by fd. Meaningful only while a
-// connection is in the EPOLLOUT state.
-sent:
-        .skip   MAX_FDS * 4
+logpfx:                                    // "255.255.255.255:65535 "
+        .skip   32
+numtmp:                                    // digit scratch for utoa
+        .skip   8
 
 // -----------------------------------------------------------------------------
 .section .text
@@ -106,6 +131,8 @@ sent:
 //   x19 = listening socket   x20 = epoll fd
 //   x21 = current event ptr  x22 = events remaining in this batch
 //   x23 = current fd         x24 = current event mask
+//   x25 = connection buffer  x26 = bytes buffered
+//   x27 = log length         x28 = log prefix base
 _start:
         // listen_fd = socket(AF_INET, SOCK_STREAM|SOCK_NONBLOCK, 0)
         // Non-blocking from birth, so accept() never stalls the loop.
@@ -206,12 +233,17 @@ _start:
 
 // ---- listening socket: drain the backlog ------------------------------------
 .Laccept_more:
-        // conn_fd = accept4(listen_fd, NULL, NULL, SOCK_NONBLOCK)
+        // conn_fd = accept4(listen_fd, &acceptaddr, &acceptlen, SOCK_NONBLOCK)
         // Loop until EAGAIN: epoll is level-triggered, but taking every pending
         // connection now saves a lap round the loop for each one.
+        adrp    x9, acceptlen
+        add     x9, x9, #:lo12:acceptlen
+        mov     w10, #16                        // kernel overwrites this
+        str     w10, [x9]
         mov     x0, x19
-        mov     x1, #0
-        mov     x2, #0
+        adrp    x1, acceptaddr
+        add     x1, x1, #:lo12:acceptaddr
+        mov     x2, x9
         mov     x3, #SOCK_NONBLOCK
         mov     x8, #SYS_accept4
         svc     #0
@@ -220,7 +252,24 @@ _start:
 
         mov     x9, #MAX_FDS
         cmp     x23, x9
-        b.hs    .Lrefuse                        // no room in the state table
+        b.hs    .Lrefuse                        // no room in the state tables
+
+        // Stash the peer address now; by the time the request is logged the
+        // accept buffer will have been reused by later connections.
+        adrp    x9, acceptaddr
+        add     x9, x9, #:lo12:acceptaddr
+        ldr     w10, [x9, #4]                   // sin_addr
+        ldrh    w11, [x9, #2]                   // sin_port
+        adrp    x9, peers
+        add     x9, x9, #:lo12:peers
+        add     x9, x9, x23, lsl #3
+        str     w10, [x9]
+        strh    w11, [x9, #4]
+
+        // fd numbers get recycled, so clear this slot before reusing it.
+        adrp    x9, rlen
+        add     x9, x9, #:lo12:rlen
+        str     wzr, [x9, x23, lsl #2]
 
         // Register it for reading. Being in the EPOLLIN set *is* the
         // "awaiting request" state; no separate state variable needed.
@@ -242,18 +291,139 @@ _start:
         b       .Laccept_more
 
 // ---- connection is readable -------------------------------------------------
+// Accumulate until the header block is complete -- that is, until a blank line
+// shows up -- then log the lot and reply.
 .Ldo_read:
+        adrp    x25, reqbufs
+        add     x25, x25, #:lo12:reqbufs
+        add     x25, x25, x23, lsl #CONN_BUF_SHIFT      // this conn's buffer
+        adrp    x9, rlen
+        add     x9, x9, #:lo12:rlen
+        ldr     w26, [x9, x23, lsl #2]                  // bytes already buffered
+        mov     x2, #CONN_BUF
+        sub     x2, x2, x26                             // space left
+        cbz     x2, .Ldrop                              // headers too big
+
+        // read(fd, buf + off, space)
+        add     x1, x25, x26
         mov     x0, x23
-        adrp    x1, reqbuf
-        add     x1, x1, #:lo12:reqbuf
-        mov     x2, #REQBUF_SIZE
         mov     x8, #SYS_read
         svc     #0
         cmp     x0, #0
         ble     .Lread_err
 
-        // The request is not parsed beyond "something arrived". Flip the
-        // connection over to writing; the reply goes out on the next lap.
+        add     w26, w26, w0                            // newlen = off + n
+        adrp    x9, rlen
+        add     x9, x9, #:lo12:rlen
+        str     w26, [x9, x23, lsl #2]
+
+        // Hunt for the blank line that ends the headers: "\n\n" or "\n\r\n".
+        // Rescanning from the start each time is O(n^2), but n is a few hundred
+        // bytes and it keeps the resumption logic to nothing.
+        mov     x9, #0
+.Lscan:
+        add     x10, x9, #1
+        cmp     x10, x26
+        b.hs    .Lneed_more                     // need at least two bytes
+        ldrb    w11, [x25, x9]
+        cmp     w11, #CH_LF
+        b.ne    .Lscan_next
+        ldrb    w11, [x25, x10]
+        cmp     w11, #CH_LF
+        b.eq    .Lfound_lf
+        cmp     w11, #CH_CR
+        b.ne    .Lscan_next
+        add     x10, x9, #2
+        cmp     x10, x26
+        b.hs    .Lneed_more                     // saw "\n\r", nothing after yet
+        ldrb    w11, [x25, x10]
+        cmp     w11, #CH_LF
+        b.eq    .Lfound_crlf
+.Lscan_next:
+        add     x9, x9, #1
+        b       .Lscan
+
+.Lfound_lf:
+        add     x26, x9, #2                     // bytes of header block
+        b       .Lhave_headers
+.Lfound_crlf:
+        add     x26, x9, #3
+        b       .Lhave_headers
+
+.Lneed_more:
+        mov     x10, #CONN_BUF
+        cmp     x26, x10
+        b.hs    .Ldrop                          // buffer full, no blank line
+        b       .Lnext                          // stay in EPOLLIN for the rest
+
+.Lread_err:
+        cmn     x0, #EAGAIN                     // x0 == -EAGAIN ?
+        b.eq    .Lnext                          // nothing yet; keep waiting
+        b       .Ldrop                          // 0 = peer hung up, <0 = error
+
+// ---- log the request --------------------------------------------------------
+// Two writes, back to back: "ip:port " out of a scratch buffer, then the header
+// block straight out of the connection buffer. Nothing else can log in between,
+// so the pair stays contiguous without a copy into one place.
+//
+// x25 = buffer base, x26 = length of the header block.
+.Lhave_headers:
+        // Strip CRs in place so the log holds clean lines. dst never overtakes
+        // src, so this is safe to do without a second buffer.
+        mov     x9, #0                          // src index
+        mov     x27, #0                         // dst index
+.Lstrip:
+        cmp     x9, x26
+        b.hs    .Lstripped
+        ldrb    w10, [x25, x9]
+        add     x9, x9, #1
+        cmp     w10, #CH_CR
+        b.eq    .Lstrip
+        strb    w10, [x25, x27]
+        add     x27, x27, #1
+        b       .Lstrip
+.Lstripped:
+
+        // Build "ip:port " -- four octets and a port, all straight out of the
+        // network-order bytes stashed at accept time.
+        adrp    x28, logpfx
+        add     x28, x28, #:lo12:logpfx
+        mov     x1, x28                         // running dest
+        adrp    x11, peers
+        add     x11, x11, #:lo12:peers
+        add     x11, x11, x23, lsl #3
+        ldrb    w0, [x11, #0]
+        bl      .Lutoa
+        mov     w10, #CH_DOT
+        strb    w10, [x1], #1
+        ldrb    w0, [x11, #1]
+        bl      .Lutoa
+        mov     w10, #CH_DOT
+        strb    w10, [x1], #1
+        ldrb    w0, [x11, #2]
+        bl      .Lutoa
+        mov     w10, #CH_DOT
+        strb    w10, [x1], #1
+        ldrb    w0, [x11, #3]
+        bl      .Lutoa
+        mov     w10, #CH_COLON
+        strb    w10, [x1], #1
+        ldrh    w0, [x11, #4]
+        rev16   w0, w0                          // ntohs
+        bl      .Lutoa
+        mov     w10, #CH_SPACE
+        strb    w10, [x1], #1
+
+        sub     x2, x1, x28                     // prefix length
+        mov     x1, x28
+        bl      .Lwrite_all
+
+        mov     x1, x25
+        mov     x2, x27
+        bl      .Lwrite_all
+
+.Lto_send:
+        // Flip the connection over to writing; the reply goes out next lap.
         adrp    x9, sent
         add     x9, x9, #:lo12:sent
         str     wzr, [x9, x23, lsl #2]
@@ -267,11 +437,6 @@ _start:
         mov     x8, #SYS_epoll_ctl
         svc     #0
         b       .Lnext
-
-.Lread_err:
-        cmn     x0, #EAGAIN                     // x0 == -EAGAIN ?
-        b.eq    .Lnext                          // nothing yet; keep waiting
-        b       .Ldrop                          // 0 = peer hung up, <0 = error
 
 // ---- connection is writable -------------------------------------------------
 .Ldo_write:
@@ -317,12 +482,57 @@ _start:
         svc     #0
         b       .Lnext
 
+// -----------------------------------------------------------------------------
 // Fill `ev` with {events = w9, data = x23}. Clobbers x9, x10; returns via x30.
 .Lset_ev:
         adrp    x10, ev
         add     x10, x10, #:lo12:ev
         str     w9, [x10]
         str     x23, [x10, #EVENT_DATA_OFF]
+        ret
+
+// write_all(x1 = buf, x2 = len) -- push it all to stdout, short writes and all.
+// Gives up silently if stdout has gone away. Clobbers x0, x1, x2, x8.
+//
+// This is the one blocking call in the whole loop: if the container's log pipe
+// backs up, every connection waits behind it.
+.Lwrite_all:
+        cbz     x2, .Lwa_done
+.Lwa_loop:
+        mov     x0, #STDOUT
+        mov     x8, #SYS_write
+        svc     #0
+        cmp     x0, #0
+        ble     .Lwa_done
+        add     x1, x1, x0
+        subs    x2, x2, x0
+        b.ne    .Lwa_loop
+.Lwa_done:
+        ret
+
+// utoa(w0 = value, x1 = dest) -- write the value in decimal, return x1 just
+// past the last digit. Digits fall out backwards, so they land in a scratch
+// buffer first and get copied over. Clobbers x0, x9, x10, x12, x13, x14, x15.
+.Lutoa:
+        adrp    x12, numtmp
+        add     x12, x12, #:lo12:numtmp
+        add     x13, x12, #8                    // one past the end
+        mov     x14, x13                        // cursor, walking backwards
+        mov     w15, #10
+.Lu_digit:
+        udiv    w9, w0, w15
+        msub    w10, w9, w15, w0                // w10 = value % 10
+        add     w10, w10, #CH_ZERO
+        sub     x14, x14, #1
+        strb    w10, [x14]
+        mov     w0, w9
+        cbnz    w0, .Lu_digit
+.Lu_copy:
+        ldrb    w10, [x14]
+        strb    w10, [x1], #1
+        add     x14, x14, #1
+        cmp     x14, x13
+        b.lo    .Lu_copy
         ret
 
 .Lfail:

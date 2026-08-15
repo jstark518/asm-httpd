@@ -6,6 +6,7 @@ DEFAULT REL
 
 ; ---- syscall numbers (x86-64 Linux) -----------------------------------------
 %define SYS_read            0
+%define SYS_write           1
 %define SYS_close           3
 %define SYS_socket          41
 %define SYS_sendto          44
@@ -41,12 +42,14 @@ DEFAULT REL
 %define EVENT_DATA_OFF  4
 
 %define EAGAIN          11
+%define STDOUT          1
 
 %define PORT            8080
 %define BACKLOG         128
-%define REQBUF_SIZE     8192
 %define MAX_EVENTS      64
-%define MAX_FDS         4096        ; bounds the per-connection state table
+%define MAX_FDS         1024        ; bounds the per-connection state tables
+%define CONN_BUF_SHIFT  12
+%define CONN_BUF        (1 << CONN_BUF_SHIFT)
 
 ; -----------------------------------------------------------------------------
 section .rodata
@@ -84,9 +87,20 @@ response_len    equ $ - response
 ; -----------------------------------------------------------------------------
 section .bss
 
-; Every connection reads into the same buffer. That is safe only because the
-; request is never parsed -- it is read to drain the socket and then discarded.
-reqbuf: resb REQBUF_SIZE
+; Per-connection request buffers, indexed by fd. Headers are parsed rather than
+; discarded, and they arrive a fragment at a time interleaved with other
+; connections, so each fd needs somewhere of its own to accumulate.
+reqbufs:        resb MAX_FDS * CONN_BUF
+
+rlen:   resd MAX_FDS                            ; bytes buffered, per fd
+sent:   resd MAX_FDS                            ; response bytes sent, per fd
+
+; Peer address per fd, captured at accept: 4 bytes of IPv4 then 2 of port, both
+; still in network byte order.
+peers:  resb MAX_FDS * 8
+
+acceptaddr:     resb 16                         ; sockaddr_in filled by accept4
+acceptlen:      resd 1                          ; its length, in and out
 
 events: resb MAX_EVENTS * EVENT_SIZE            ; epoll_pwait output
 
@@ -94,9 +108,8 @@ ev:                                             ; scratch epoll_event for _ctl
 ev_events:      resd 1
 ev_data:        resq 1
 
-; Bytes of the response already sent, indexed by fd. Meaningful only while a
-; connection is in the EPOLLOUT state.
-sent:   resd MAX_FDS
+logpfx: resb 32                                 ; "255.255.255.255:65535 "
+numtmp: resb 8                                  ; digit scratch for utoa
 
 ; -----------------------------------------------------------------------------
 section .text
@@ -206,13 +219,14 @@ _start:
 
 ; ---- listening socket: drain the backlog ------------------------------------
 .accept_more:
-        ; conn_fd = accept4(listen_fd, NULL, NULL, SOCK_NONBLOCK)
+        ; conn_fd = accept4(listen_fd, &acceptaddr, &acceptlen, SOCK_NONBLOCK)
         ; Loop until EAGAIN: epoll is level-triggered, but taking every pending
         ; connection now saves a lap round the loop for each one.
+        mov     dword [acceptlen], 16           ; kernel overwrites this
         mov     eax, SYS_accept4
         mov     edi, r12d
-        xor     esi, esi
-        xor     edx, edx
+        lea     rsi, [acceptaddr]
+        lea     rdx, [acceptlen]
         mov     r10d, SOCK_NONBLOCK
         syscall
         test    eax, eax
@@ -220,7 +234,17 @@ _start:
         mov     ebx, eax
 
         cmp     ebx, MAX_FDS
-        jae     .refuse                         ; no room in the state table
+        jae     .refuse                         ; no room in the state tables
+
+        ; Stash the peer address now; by the time the request is logged the
+        ; accept buffer will have been reused by later connections.
+        mov     eax, [acceptaddr + 4]           ; sin_addr
+        mov     [peers + rbx*8], eax
+        mov     ax, [acceptaddr + 2]            ; sin_port
+        mov     [peers + rbx*8 + 4], ax
+
+        ; fd numbers get recycled, so clear this slot before reusing it.
+        mov     dword [rlen + rbx*4], 0
 
         ; Register it for reading. Being in the EPOLLIN set *is* the
         ; "awaiting request" state; no separate state variable needed.
@@ -241,17 +265,139 @@ _start:
         jmp     .accept_more
 
 ; ---- connection is readable -------------------------------------------------
+; Accumulate until the header block is complete -- that is, until a blank line
+; shows up -- then log the lot and reply.
 .do_read:
+        mov     ecx, ebx
+        shl     rcx, CONN_BUF_SHIFT
+        lea     rsi, [reqbufs]
+        add     rsi, rcx                        ; rsi = this connection's buffer
+        mov     r9d, [rlen + rbx*4]             ; bytes already buffered
+        mov     edx, CONN_BUF
+        sub     edx, r9d                        ; space left
+        jbe     .drop                           ; headers too big
+
+        ; read(fd, buf + off, space)
+        add     rsi, r9
         mov     eax, SYS_read
         mov     edi, ebx
-        lea     rsi, [reqbuf]
-        mov     edx, REQBUF_SIZE
         syscall
         test    rax, rax
         jle     .read_err
 
-        ; The request is not parsed beyond "something arrived". Flip the
-        ; connection over to writing; the reply goes out on the next lap.
+        add     eax, r9d                        ; newlen = off + n
+        mov     [rlen + rbx*4], eax
+        mov     edx, eax
+
+        mov     ecx, ebx
+        shl     rcx, CONN_BUF_SHIFT
+        lea     rsi, [reqbufs]
+        add     rsi, rcx                        ; rsi = buffer base again
+
+        ; Hunt for the blank line that ends the headers: "\n\n" or "\n\r\n".
+        ; Rescanning from the start each time is O(n^2), but n is a few hundred
+        ; bytes and it keeps the resumption logic to nothing.
+        xor     ecx, ecx
+.scan:
+        lea     eax, [ecx + 1]
+        cmp     eax, edx
+        jae     .need_more                      ; need at least two bytes
+        cmp     byte [rsi + rcx], 10
+        jne     .scan_next
+        cmp     byte [rsi + rcx + 1], 10
+        je      .found_lf
+        cmp     byte [rsi + rcx + 1], 13
+        jne     .scan_next
+        lea     eax, [ecx + 2]
+        cmp     eax, edx
+        jae     .need_more                      ; saw "\n\r", nothing after yet
+        cmp     byte [rsi + rcx + 2], 10
+        je      .found_crlf
+.scan_next:
+        inc     ecx
+        jmp     .scan
+
+.found_lf:
+        lea     edx, [ecx + 2]                  ; bytes of header block
+        jmp     .have_headers
+.found_crlf:
+        lea     edx, [ecx + 3]
+        jmp     .have_headers
+
+.need_more:
+        cmp     edx, CONN_BUF
+        jae     .drop                           ; buffer full, still no blank line
+        jmp     .next                           ; stay in EPOLLIN for the rest
+
+.read_err:
+        cmp     rax, -EAGAIN
+        je      .next                           ; nothing yet; keep waiting
+        jmp     .drop                           ; 0 = peer hung up, <0 = error
+
+; ---- log the request --------------------------------------------------------
+; Two writes, back to back: "ip:port " out of a scratch buffer, then the header
+; block straight out of the connection buffer. Nothing else can log in between,
+; so the pair stays contiguous without a copy into one place.
+;
+; rsi = buffer base, rdx = length of the header block.
+.have_headers:
+        ; Strip CRs in place so the log holds clean lines. dst never overtakes
+        ; src, so this is safe to do without a second buffer.
+        mov     rdi, rsi                        ; dst
+        xor     ecx, ecx                        ; src index
+.strip:
+        cmp     ecx, edx
+        jae     .stripped
+        mov     al, [rsi + rcx]
+        inc     ecx
+        cmp     al, 13
+        je      .strip
+        mov     [rdi], al
+        inc     rdi
+        jmp     .strip
+.stripped:
+        sub     rdi, rsi
+        mov     ebp, edi                        ; ebp = length after stripping
+
+        ; Build "ip:port " -- four octets and a port, all straight out of the
+        ; network-order bytes stashed at accept time.
+        lea     rdi, [logpfx]
+        movzx   eax, byte [peers + rbx*8 + 0]
+        call    utoa
+        mov     byte [rdi], '.'
+        inc     rdi
+        movzx   eax, byte [peers + rbx*8 + 1]
+        call    utoa
+        mov     byte [rdi], '.'
+        inc     rdi
+        movzx   eax, byte [peers + rbx*8 + 2]
+        call    utoa
+        mov     byte [rdi], '.'
+        inc     rdi
+        movzx   eax, byte [peers + rbx*8 + 3]
+        call    utoa
+        mov     byte [rdi], ':'
+        inc     rdi
+        movzx   eax, word [peers + rbx*8 + 4]
+        xchg    al, ah                          ; ntohs
+        call    utoa
+        mov     byte [rdi], ' '
+        inc     rdi
+
+        lea     rsi, [logpfx]
+        mov     rdx, rdi
+        sub     rdx, rsi                        ; prefix length
+        call    write_all
+
+        mov     ecx, ebx
+        shl     rcx, CONN_BUF_SHIFT
+        lea     rsi, [reqbufs]
+        add     rsi, rcx
+        mov     edx, ebp
+        call    write_all
+
+.to_send:
+        ; Flip the connection over to writing; the reply goes out next lap.
         mov     dword [sent + rbx*4], 0
         mov     dword [ev_events], EPOLLOUT
         mov     [ev_data], rbx
@@ -262,11 +408,6 @@ _start:
         lea     r10, [ev]
         syscall
         jmp     .next
-
-.read_err:
-        cmp     rax, -EAGAIN
-        je      .next                           ; nothing yet; keep waiting
-        jmp     .drop                           ; 0 = peer hung up, <0 = error
 
 ; ---- connection is writable -------------------------------------------------
 .do_write:
@@ -309,3 +450,49 @@ _start:
         mov     eax, SYS_exit
         mov     edi, 1
         syscall
+
+; -----------------------------------------------------------------------------
+; write_all(rsi = buf, rdx = len) -- push it all to stdout, short writes and
+; all. Gives up silently if stdout has gone away. Clobbers rax, rcx, rsi, rdx,
+; rdi, r11.
+;
+; This is the one blocking call in the whole loop: if the container's log pipe
+; backs up, every connection waits behind it.
+write_all:
+        test    rdx, rdx
+        jz      .wa_done
+.wa_loop:
+        mov     eax, SYS_write
+        mov     edi, STDOUT
+        syscall
+        test    rax, rax
+        jle     .wa_done
+        add     rsi, rax
+        sub     rdx, rax
+        jnz     .wa_loop
+.wa_done:
+        ret
+
+; utoa(eax = value, rdi = dest) -- write the value in decimal, return rdi just
+; past the last digit. Digits fall out backwards, so they land in a scratch
+; buffer first and get copied over. Clobbers rax, rcx, rdx, rsi.
+utoa:
+        mov     ecx, 10
+        lea     rsi, [numtmp + 8]
+.u_digit:
+        xor     edx, edx
+        div     ecx                             ; edx = value % 10
+        add     dl, '0'
+        dec     rsi
+        mov     [rsi], dl
+        test    eax, eax
+        jnz     .u_digit
+.u_copy:
+        mov     al, [rsi]
+        mov     [rdi], al
+        inc     rsi
+        inc     rdi
+        lea     rdx, [numtmp + 8]
+        cmp     rsi, rdx
+        jb      .u_copy
+        ret
