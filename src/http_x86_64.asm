@@ -50,6 +50,7 @@ DEFAULT REL
 %define MAX_FDS         1024        ; bounds the per-connection state tables
 %define CONN_BUF_SHIFT  12
 %define CONN_BUF        (1 << CONN_BUF_SHIFT)
+%define JSONLOG_MAX     4096        ; parsed body lines are built up here
 
 ; -----------------------------------------------------------------------------
 section .rodata
@@ -84,6 +85,22 @@ response_len    equ $ - response
   %error "Content-Length header is out of sync with the response body"
 %endif
 
+; The header we hunt for in the request, lowercased for case-folded matching.
+cl_name:        db "content-length:"
+cl_name_len     equ $ - cl_name
+
+s_indent:       db "  "
+s_indent_len    equ $ - s_indent
+s_eq:           db " = "
+s_eq_len        equ $ - s_eq
+s_nl:           db 10
+s_bad:          db "  <malformed JSON>", 10
+s_bad_len       equ $ - s_bad
+s_nonjson_a:    db "  <non-JSON body, "
+s_nonjson_a_len equ $ - s_nonjson_a
+s_nonjson_b:    db " bytes>", 10
+s_nonjson_b_len equ $ - s_nonjson_b
+
 ; -----------------------------------------------------------------------------
 section .bss
 
@@ -94,6 +111,13 @@ reqbufs:        resb MAX_FDS * CONN_BUF
 
 rlen:   resd MAX_FDS                            ; bytes buffered, per fd
 sent:   resd MAX_FDS                            ; response bytes sent, per fd
+
+; Where the body starts, per fd -- the offset just past the blank line. Zero
+; means the header block has not landed yet, which doubles as the sub-state
+; flag inside the reading phase: no real request can have a body at offset 0.
+hdrend: resd MAX_FDS
+clen:   resd MAX_FDS                            ; Content-Length, per fd
+hlog:   resd MAX_FDS                            ; header bytes after CR-stripping
 
 ; Peer address per fd, captured at accept: 4 bytes of IPv4 then 2 of port, both
 ; still in network byte order.
@@ -110,6 +134,13 @@ ev_data:        resq 1
 
 logpfx: resb 32                                 ; "255.255.255.255:65535 "
 numtmp: resb 8                                  ; digit scratch for utoa
+numbuf: resb 16                                 ; formatted number, for jappend
+
+; The parsed body is assembled here as text and written in one go, rather than
+; a syscall per key.
+jsonlog:        resb JSONLOG_MAX
+jlen:           resd 1                          ; bytes used in jsonlog
+jlinestart:     resd 1                          ; jlen at the start of this pair
 
 ; -----------------------------------------------------------------------------
 section .text
@@ -245,6 +276,7 @@ _start:
 
         ; fd numbers get recycled, so clear this slot before reusing it.
         mov     dword [rlen + rbx*4], 0
+        mov     dword [hdrend + rbx*4], 0
 
         ; Register it for reading. Being in the EPOLLIN set *is* the
         ; "awaiting request" state; no separate state variable needed.
@@ -265,8 +297,10 @@ _start:
         jmp     .accept_more
 
 ; ---- connection is readable -------------------------------------------------
-; Accumulate until the header block is complete -- that is, until a blank line
-; shows up -- then log the lot and reply.
+; Two phases, told apart by hdrend: accumulate until the blank line that ends
+; the headers, then keep going until Content-Length bytes of body have landed.
+; Only once the whole request is in does anything get logged, so a request's
+; output stays in one piece even while other connections are mid-flight.
 .do_read:
         mov     ecx, ebx
         shl     rcx, CONN_BUF_SHIFT
@@ -293,6 +327,9 @@ _start:
         shl     rcx, CONN_BUF_SHIFT
         lea     rsi, [reqbufs]
         add     rsi, rcx                        ; rsi = buffer base again
+
+        cmp     dword [hdrend + rbx*4], 0
+        jne     .check_body                     ; headers already done
 
         ; Hunt for the blank line that ends the headers: "\n\n" or "\n\r\n".
         ; Rescanning from the start each time is O(n^2), but n is a few hundred
@@ -334,15 +371,18 @@ _start:
         je      .next                           ; nothing yet; keep waiting
         jmp     .drop                           ; 0 = peer hung up, <0 = error
 
-; ---- log the request --------------------------------------------------------
-; Two writes, back to back: "ip:port " out of a scratch buffer, then the header
-; block straight out of the connection buffer. Nothing else can log in between,
-; so the pair stays contiguous without a copy into one place.
+; ---- headers are in ---------------------------------------------------------
+; Note the body offset, tidy the headers up for logging, and find out how much
+; body to expect. Runs exactly once per connection; the hdrend check above
+; keeps later reads out of here.
 ;
-; rsi = buffer base, rdx = length of the header block.
+; rsi = buffer base, rdx = raw length of the header block.
 .have_headers:
+        mov     [hdrend + rbx*4], edx           ; body starts here
+
         ; Strip CRs in place so the log holds clean lines. dst never overtakes
-        ; src, so this is safe to do without a second buffer.
+        ; src, so this is safe to do without a second buffer. Only the headers
+        ; are touched -- body bytes already sitting past hdrend stay put.
         mov     rdi, rsi                        ; dst
         xor     ecx, ecx                        ; src index
 .strip:
@@ -357,8 +397,29 @@ _start:
         jmp     .strip
 .stripped:
         sub     rdi, rsi
-        mov     ebp, edi                        ; ebp = length after stripping
+        mov     [hlog + rbx*4], edi             ; header bytes worth logging
 
+        ; Content-Length off the tidied headers, where lines end in a bare \n.
+        mov     rdx, rdi
+        call    find_clen
+        mov     [clen + rbx*4], eax
+
+        ; Refuse anything whose body cannot fit alongside its headers.
+        add     eax, [hdrend + rbx*4]
+        cmp     eax, CONN_BUF
+        ja      .drop
+
+; ---- is the whole request in yet? -------------------------------------------
+.check_body:
+        mov     eax, [hdrend + rbx*4]
+        add     eax, [clen + rbx*4]             ; bytes the full request needs
+        cmp     [rlen + rbx*4], eax
+        jb      .next                           ; still waiting on body
+
+; ---- log the request --------------------------------------------------------
+; Writes go out back to back and nothing else can log in between, so the pieces
+; stay contiguous without being copied into one place first.
+.complete:
         ; Build "ip:port " -- four octets and a port, all straight out of the
         ; network-order bytes stashed at accept time.
         lea     rdi, [logpfx]
@@ -393,7 +454,61 @@ _start:
         shl     rcx, CONN_BUF_SHIFT
         lea     rsi, [reqbufs]
         add     rsi, rcx
-        mov     edx, ebp
+        mov     edx, [hlog + rbx*4]
+        call    write_all
+
+        ; Nothing more to say if the request had no body.
+        mov     edx, [clen + rbx*4]
+        test    edx, edx
+        jz      .to_send
+
+        ; Body: parse it as JSON if it looks like JSON, otherwise just say how
+        ; big it was. Either way the result is assembled in jsonlog and written
+        ; once, rather than a syscall per key.
+        mov     dword [jlen], 0
+        mov     ecx, ebx
+        shl     rcx, CONN_BUF_SHIFT
+        lea     rsi, [reqbufs]
+        add     rsi, rcx
+        add     esi, [hdrend + rbx*4]           ; rsi = body
+
+        xor     ecx, ecx                        ; sniff past leading whitespace
+.sniff:
+        cmp     ecx, edx
+        jae     .nonjson
+        mov     al, [rsi + rcx]
+        cmp     al, ' '
+        ja      .sniffed
+        inc     ecx
+        jmp     .sniff
+.sniffed:
+        cmp     al, '{'
+        jne     .nonjson
+        call    json_log
+        jmp     .logged
+
+.nonjson:
+        lea     rsi, [s_nonjson_a]
+        mov     edx, s_nonjson_a_len
+        call    jappend
+        lea     rdi, [numbuf]
+        mov     eax, [clen + rbx*4]
+        call    utoa
+        lea     rsi, [numbuf]
+        mov     rdx, rdi
+        sub     rdx, rsi
+        call    jappend
+        lea     rsi, [s_nonjson_b]
+        mov     edx, s_nonjson_b_len
+        call    jappend
+
+.logged:
+        ; Blank line so consecutive requests stay readable.
+        lea     rsi, [s_nl]
+        mov     edx, 1
+        call    jappend
+        lea     rsi, [jsonlog]
+        mov     edx, [jlen]
         call    write_all
 
 .to_send:
@@ -471,6 +586,257 @@ write_all:
         sub     rdx, rax
         jnz     .wa_loop
 .wa_done:
+        ret
+
+; find_clen(rsi = headers, rdx = len) -> eax -- the Content-Length value, or 0
+; if the header is absent. Expects CR-stripped headers, so lines end in \n.
+; Matching is case-folded with OR 0x20, which leaves ':' and '-' alone.
+; Clobbers rax, rcx, r8, r9, r10.
+find_clen:
+        xor     r8d, r8d                        ; index of the current line
+.fc_line:
+        xor     ecx, ecx                        ; how much of the name matched
+.fc_cmp:
+        cmp     ecx, cl_name_len
+        jae     .fc_hit
+        lea     r9, [r8 + rcx]
+        cmp     r9, rdx
+        jae     .fc_none                        ; ran off the end mid-name
+        movzx   r10d, byte [rsi + r9]
+        or      r10d, 0x20                      ; fold to lower case
+        lea     rax, [cl_name]
+        cmp     r10b, [rax + rcx]
+        jne     .fc_next
+        inc     ecx
+        jmp     .fc_cmp
+
+.fc_hit:
+        lea     r9, [r8 + cl_name_len]
+.fc_space:
+        cmp     r9, rdx
+        jae     .fc_none
+        cmp     byte [rsi + r9], ' '
+        jne     .fc_digits
+        inc     r9
+        jmp     .fc_space
+.fc_digits:
+        xor     eax, eax
+.fc_digit:
+        cmp     r9, rdx
+        jae     .fc_ret
+        movzx   ecx, byte [rsi + r9]
+        sub     ecx, '0'
+        cmp     ecx, 9
+        ja      .fc_ret
+        imul    eax, eax, 10
+        add     eax, ecx
+        inc     r9
+        jmp     .fc_digit
+.fc_ret:
+        ret
+
+.fc_next:
+        ; Skip to the start of the next line and try again.
+        cmp     r8, rdx
+        jae     .fc_none
+        cmp     byte [rsi + r8], 10
+        je      .fc_advance
+        inc     r8
+        jmp     .fc_next
+.fc_advance:
+        inc     r8
+        cmp     r8, rdx
+        jae     .fc_none
+        jmp     .fc_line
+
+.fc_none:
+        xor     eax, eax
+        ret
+
+; jappend(rsi = src, rdx = len) -- tack bytes onto jsonlog, silently truncating
+; if it would overflow. Deliberately leaves rbp and r8-r11 alone so the parser
+; can keep its cursor and token registers across a call.
+; Clobbers rax, rcx, rdx, rsi, rdi.
+jappend:
+        mov     ecx, [jlen]
+        mov     eax, JSONLOG_MAX
+        sub     eax, ecx                        ; space remaining
+        cmp     rdx, rax
+        jbe     .ja_fits
+        mov     edx, eax                        ; truncate
+.ja_fits:
+        test    edx, edx
+        jz      .ja_done
+        lea     rdi, [jsonlog]
+        add     rdi, rcx
+        add     [jlen], edx
+.ja_copy:
+        mov     al, [rsi]
+        mov     [rdi], al
+        inc     rsi
+        inc     rdi
+        dec     edx
+        jnz     .ja_copy
+.ja_done:
+        ret
+
+; json_log(rsi = body, rdx = len) -- parse a flat JSON object and append one
+; "  key = value" line per pair to jsonlog.
+;
+; Deliberately shallow: top-level scalars only, and string contents are logged
+; raw rather than unescaped, so "a\nb" appears with its backslash intact. What
+; it does handle is \" inside strings, so an escaped quote does not end a token
+; early. Anything it cannot make sense of collapses to <malformed JSON>, with
+; the half-built line rolled back so the output stays tidy.
+;
+; rbp = cursor, r8 = end, r9/r10 = current token. Clobbers rax, rcx, rdx, rsi,
+; rdi, rbp, r8, r9, r10.
+json_log:
+        mov     rbp, rsi                        ; cursor
+        mov     r8, rsi
+        add     r8, rdx                         ; end
+        mov     eax, [jlen]
+        mov     [jlinestart], eax
+
+        call    .skip_ws
+        cmp     rbp, r8
+        jae     .bad
+        cmp     byte [rbp], '{'
+        jne     .bad
+        inc     rbp
+        call    .skip_ws
+        cmp     rbp, r8
+        jae     .bad
+        cmp     byte [rbp], '}'
+        je      .done                           ; {} is legal and boring
+
+.pair:
+        mov     eax, [jlen]
+        mov     [jlinestart], eax               ; rollback point for this line
+
+        call    .skip_ws
+        cmp     rbp, r8
+        jae     .bad
+        cmp     byte [rbp], '"'
+        jne     .bad
+        call    .scan_string
+        jc      .bad
+
+        lea     rsi, [s_indent]
+        mov     edx, s_indent_len
+        call    jappend
+        mov     rsi, r9
+        mov     rdx, r10
+        call    jappend
+        lea     rsi, [s_eq]
+        mov     edx, s_eq_len
+        call    jappend
+
+        call    .skip_ws
+        cmp     rbp, r8
+        jae     .bad
+        cmp     byte [rbp], ':'
+        jne     .bad
+        inc     rbp
+        call    .skip_ws
+        cmp     rbp, r8
+        jae     .bad
+
+        cmp     byte [rbp], '"'
+        je      .value_string
+        ; Bare scalar -- number, true, false, null. Runs to whitespace or to
+        ; whatever punctuation ends the pair.
+        mov     r9, rbp
+.value_scan:
+        cmp     rbp, r8
+        jae     .value_end
+        mov     al, [rbp]
+        cmp     al, ','
+        je      .value_end
+        cmp     al, '}'
+        je      .value_end
+        cmp     al, ' '
+        jbe     .value_end
+        inc     rbp
+        jmp     .value_scan
+.value_end:
+        mov     r10, rbp
+        sub     r10, r9
+        jz      .bad                            ; ':' with nothing after it
+        jmp     .value_emit
+
+.value_string:
+        call    .scan_string
+        jc      .bad
+
+.value_emit:
+        mov     rsi, r9
+        mov     rdx, r10
+        call    jappend
+        lea     rsi, [s_nl]
+        mov     edx, 1
+        call    jappend
+
+        call    .skip_ws
+        cmp     rbp, r8
+        jae     .bad
+        mov     al, [rbp]
+        cmp     al, ','
+        jne     .maybe_close
+        inc     rbp
+        jmp     .pair
+.maybe_close:
+        cmp     al, '}'
+        jne     .bad
+.done:
+        ret
+
+.bad:
+        ; Throw away the partial line, then say so.
+        mov     eax, [jlinestart]
+        mov     [jlen], eax
+        lea     rsi, [s_bad]
+        mov     edx, s_bad_len
+        call    jappend
+        ret
+
+; Advance the cursor past spaces, tabs, CRs and newlines.
+.skip_ws:
+        cmp     rbp, r8
+        jae     .sw_ret
+        cmp     byte [rbp], ' '
+        ja      .sw_ret
+        inc     rbp
+        jmp     .skip_ws
+.sw_ret:
+        ret
+
+; Cursor sits on the opening quote. Sets r9/r10 to the contents and leaves the
+; cursor past the closing quote. CF set if the string never closes.
+.scan_string:
+        inc     rbp
+        mov     r9, rbp
+.ss_scan:
+        cmp     rbp, r8
+        jae     .ss_err
+        mov     al, [rbp]
+        cmp     al, 92                          ; backslash: skip the pair
+        je      .ss_escape
+        cmp     al, '"'
+        je      .ss_close
+        inc     rbp
+        jmp     .ss_scan
+.ss_escape:
+        add     rbp, 2
+        jmp     .ss_scan
+.ss_close:
+        mov     r10, rbp
+        sub     r10, r9
+        inc     rbp
+        clc
+        ret
+.ss_err:
+        stc
         ret
 
 ; utoa(eax = value, rdi = dest) -- write the value in decimal, return rdi just

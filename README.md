@@ -30,12 +30,17 @@ Every request gets the same response no matter the method or path, but the
 requester and its headers are logged to stdout:
 
 ```
-192.168.65.1:60076 GET /search?q=asm HTTP/1.1
+192.168.65.1:60076 POST /api HTTP/1.1
 Host: localhost:8080
-User-Agent: curl/8.7.1
-Accept: */*
+Content-Type: application/json
+Content-Length: 30
+
+  name = Jonathan
+  count = 42
 
 ```
+
+A JSON body gets parsed and its top-level keys logged too.
 
 Each connection is really a two-state machine, and the state is just which
 event it's registered for: `EPOLLIN` while reading the request, `EPOLLOUT`
@@ -59,13 +64,40 @@ with no blank line after it will sit there unanswered. That's correct HTTP,
 but worth knowing if you're poking at it with `nc`. Bare-LF line endings work
 as well as CRLF.
 
+## JSON
+
+Reading is really two phases, told apart by one number: `hdrend`, the offset
+where the body starts. Zero means the headers haven't landed yet — no real
+request can have a body at offset 0, so it doubles as the state flag without
+costing a separate variable. Once the headers are in, `Content-Length` is read
+off them and reading continues until that many body bytes have arrived.
+
+Nothing is logged until the whole request is in, so one request's output stays
+in one piece even with other connections mid-flight.
+
+The parser is deliberately shallow — top-level scalars only:
+
+```json
+{"name": "Jonathan", "count": 42, "ok": true, "nope": null}
+```
+
+Strings are logged raw rather than unescaped, so `"a\nb"` shows up with its
+backslash intact. It does understand `\"` inside a string, so an escaped quote
+doesn't end a token early. Nested objects and arrays are not handled.
+
+Anything it can't parse collapses to `<malformed JSON>`, and the half-built
+line gets rolled back so you don't see a dangling `key = `. A body that doesn't
+start with `{` is reported as `<non-JSON body, N bytes>` rather than being
+called malformed.
+
 Two things worth knowing if you poke at it:
 
 - Sends use `MSG_NOSIGNAL`. Otherwise a client that hangs up mid-response
   raises `SIGPIPE` and kills the process.
 - The log write is the one blocking call in the loop. If the container's log
   pipe backs up, everything stalls behind it.
-- Headers over 4 KB get the connection closed with no response.
+- Headers, or headers plus body, over 4 KB get the connection closed with no
+  response.
 - The logged address is whoever actually connected. Behind Docker's port
   forwarding that's the gateway (`192.168.65.1`), not the original client.
 - `Content-Length` is a plain string in the source, so both files check it

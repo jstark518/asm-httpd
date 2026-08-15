@@ -45,6 +45,11 @@
 .set CH_ZERO,           48
 .set CH_CR,             13
 .set CH_LF,             10
+.set CH_QUOTE,          34
+.set CH_COMMA,          44
+.set CH_LBRACE,         123
+.set CH_RBRACE,         125
+.set CH_BACKSLASH,      92
 
 .set PORT_HI,           0x1f       // 8080 = 0x1f90, stored big-endian
 .set PORT_LO,           0x90
@@ -53,6 +58,7 @@
 .set MAX_FDS,           1024       // bounds the per-connection state tables
 .set CONN_BUF_SHIFT,    12
 .set CONN_BUF,          (1 << CONN_BUF_SHIFT)
+.set JSONLOG_MAX,       4096       // parsed body lines are built up here
 
 // -----------------------------------------------------------------------------
 .section .rodata
@@ -87,6 +93,29 @@ response:
         .error "Content-Length header is out of sync with the response body"
 .endif
 
+// The header we hunt for in the request, lowercased for case-folded matching.
+cl_name:
+        .ascii  "content-length:"
+.set cl_name_len, . - cl_name
+
+s_indent:
+        .ascii  "  "
+.set s_indent_len, . - s_indent
+s_eq:
+        .ascii  " = "
+.set s_eq_len, . - s_eq
+s_nl:
+        .byte   CH_LF
+s_bad:
+        .ascii  "  <malformed JSON>\n"
+.set s_bad_len, . - s_bad
+s_nonjson_a:
+        .ascii  "  <non-JSON body, "
+.set s_nonjson_a_len, . - s_nonjson_a
+s_nonjson_b:
+        .ascii  " bytes>\n"
+.set s_nonjson_b_len, . - s_nonjson_b
+
 // -----------------------------------------------------------------------------
 .section .bss
 .balign 8
@@ -100,6 +129,16 @@ reqbufs:
 rlen:                                      // bytes buffered, per fd
         .skip   MAX_FDS * 4
 sent:                                      // response bytes sent, per fd
+        .skip   MAX_FDS * 4
+
+// Where the body starts, per fd -- the offset just past the blank line. Zero
+// means the header block has not landed yet, which doubles as the sub-state
+// flag inside the reading phase: no real request can have a body at offset 0.
+hdrend:
+        .skip   MAX_FDS * 4
+clen:                                      // Content-Length, per fd
+        .skip   MAX_FDS * 4
+hlog:                                      // header bytes after CR-stripping
         .skip   MAX_FDS * 4
 
 // Peer address per fd, captured at accept: 4 bytes of IPv4 then 2 of port, both
@@ -122,6 +161,17 @@ logpfx:                                    // "255.255.255.255:65535 "
         .skip   32
 numtmp:                                    // digit scratch for utoa
         .skip   8
+numbuf:                                    // formatted number, for jappend
+        .skip   16
+
+// The parsed body is assembled here as text and written in one go, rather than
+// a syscall per key.
+jsonlog:
+        .skip   JSONLOG_MAX
+jlen:                                      // bytes used in jsonlog
+        .skip   4
+jlinestart:                                // jlen at the start of this pair
+        .skip   4
 
 // -----------------------------------------------------------------------------
 .section .text
@@ -270,6 +320,9 @@ _start:
         adrp    x9, rlen
         add     x9, x9, #:lo12:rlen
         str     wzr, [x9, x23, lsl #2]
+        adrp    x9, hdrend
+        add     x9, x9, #:lo12:hdrend
+        str     wzr, [x9, x23, lsl #2]
 
         // Register it for reading. Being in the EPOLLIN set *is* the
         // "awaiting request" state; no separate state variable needed.
@@ -291,8 +344,10 @@ _start:
         b       .Laccept_more
 
 // ---- connection is readable -------------------------------------------------
-// Accumulate until the header block is complete -- that is, until a blank line
-// shows up -- then log the lot and reply.
+// Two phases, told apart by hdrend: accumulate until the blank line that ends
+// the headers, then keep going until Content-Length bytes of body have landed.
+// Only once the whole request is in does anything get logged, so a request's
+// output stays in one piece even while other connections are mid-flight.
 .Ldo_read:
         adrp    x25, reqbufs
         add     x25, x25, #:lo12:reqbufs
@@ -316,6 +371,11 @@ _start:
         adrp    x9, rlen
         add     x9, x9, #:lo12:rlen
         str     w26, [x9, x23, lsl #2]
+
+        adrp    x9, hdrend
+        add     x9, x9, #:lo12:hdrend
+        ldr     w10, [x9, x23, lsl #2]
+        cbnz    w10, .Lcheck_body                       // headers already done
 
         // Hunt for the blank line that ends the headers: "\n\n" or "\n\r\n".
         // Rescanning from the start each time is O(n^2), but n is a few hundred
@@ -361,15 +421,20 @@ _start:
         b.eq    .Lnext                          // nothing yet; keep waiting
         b       .Ldrop                          // 0 = peer hung up, <0 = error
 
-// ---- log the request --------------------------------------------------------
-// Two writes, back to back: "ip:port " out of a scratch buffer, then the header
-// block straight out of the connection buffer. Nothing else can log in between,
-// so the pair stays contiguous without a copy into one place.
+// ---- headers are in ---------------------------------------------------------
+// Note the body offset, tidy the headers up for logging, and find out how much
+// body to expect. Runs exactly once per connection; the hdrend check above
+// keeps later reads out of here.
 //
-// x25 = buffer base, x26 = length of the header block.
+// x25 = buffer base, x26 = raw length of the header block.
 .Lhave_headers:
+        adrp    x9, hdrend
+        add     x9, x9, #:lo12:hdrend
+        str     w26, [x9, x23, lsl #2]          // body starts here
+
         // Strip CRs in place so the log holds clean lines. dst never overtakes
-        // src, so this is safe to do without a second buffer.
+        // src, so this is safe to do without a second buffer. Only the headers
+        // are touched -- body bytes already sitting past hdrend stay put.
         mov     x9, #0                          // src index
         mov     x27, #0                         // dst index
 .Lstrip:
@@ -383,7 +448,46 @@ _start:
         add     x27, x27, #1
         b       .Lstrip
 .Lstripped:
+        adrp    x9, hlog
+        add     x9, x9, #:lo12:hlog
+        str     w27, [x9, x23, lsl #2]          // header bytes worth logging
 
+        // Content-Length off the tidied headers, where lines end in a bare \n.
+        mov     x1, x25
+        mov     x2, x27
+        bl      .Lfind_clen
+        adrp    x9, clen
+        add     x9, x9, #:lo12:clen
+        str     w0, [x9, x23, lsl #2]
+
+        // Refuse anything whose body cannot fit alongside its headers.
+        adrp    x9, hdrend
+        add     x9, x9, #:lo12:hdrend
+        ldr     w10, [x9, x23, lsl #2]
+        add     w10, w10, w0
+        mov     w11, #CONN_BUF
+        cmp     w10, w11
+        b.hi    .Ldrop
+
+// ---- is the whole request in yet? -------------------------------------------
+.Lcheck_body:
+        adrp    x9, hdrend
+        add     x9, x9, #:lo12:hdrend
+        ldr     w10, [x9, x23, lsl #2]
+        adrp    x9, clen
+        add     x9, x9, #:lo12:clen
+        ldr     w11, [x9, x23, lsl #2]
+        add     w10, w10, w11                   // bytes the full request needs
+        adrp    x9, rlen
+        add     x9, x9, #:lo12:rlen
+        ldr     w12, [x9, x23, lsl #2]
+        cmp     w12, w10
+        b.lo    .Lnext                          // still waiting on body
+
+// ---- log the request --------------------------------------------------------
+// Writes go out back to back and nothing else can log in between, so the pieces
+// stay contiguous without being copied into one place first.
+.Lcomplete:
         // Build "ip:port " -- four octets and a port, all straight out of the
         // network-order bytes stashed at accept time.
         adrp    x28, logpfx
@@ -418,8 +522,75 @@ _start:
         mov     x1, x28
         bl      .Lwrite_all
 
+        adrp    x9, hlog
+        add     x9, x9, #:lo12:hlog
+        ldr     w2, [x9, x23, lsl #2]
         mov     x1, x25
-        mov     x2, x27
+        bl      .Lwrite_all
+
+        // Nothing more to say if the request had no body.
+        adrp    x9, clen
+        add     x9, x9, #:lo12:clen
+        ldr     w26, [x9, x23, lsl #2]
+        cbz     w26, .Lto_send
+
+        // Body: parse it as JSON if it looks like JSON, otherwise just say how
+        // big it was. Either way the result is assembled in jsonlog and written
+        // once, rather than a syscall per key.
+        adrp    x9, jlen
+        add     x9, x9, #:lo12:jlen
+        str     wzr, [x9]
+        adrp    x9, hdrend
+        add     x9, x9, #:lo12:hdrend
+        ldr     w10, [x9, x23, lsl #2]
+        add     x27, x25, x10                   // x27 = body
+
+        mov     x11, #0                         // sniff past leading whitespace
+.Lsniff:
+        cmp     x11, x26
+        b.hs    .Lnonjson
+        ldrb    w12, [x27, x11]
+        cmp     w12, #CH_SPACE
+        b.hi    .Lsniffed
+        add     x11, x11, #1
+        b       .Lsniff
+.Lsniffed:
+        cmp     w12, #CH_LBRACE
+        b.ne    .Lnonjson
+        mov     x1, x27
+        mov     x2, x26
+        bl      .Ljson_log
+        b       .Llogged
+
+.Lnonjson:
+        adrp    x1, s_nonjson_a
+        add     x1, x1, #:lo12:s_nonjson_a
+        mov     x2, #s_nonjson_a_len
+        bl      .Ljappend
+        adrp    x1, numbuf
+        add     x1, x1, #:lo12:numbuf
+        mov     x28, x1
+        mov     w0, w26
+        bl      .Lutoa
+        sub     x2, x1, x28
+        mov     x1, x28
+        bl      .Ljappend
+        adrp    x1, s_nonjson_b
+        add     x1, x1, #:lo12:s_nonjson_b
+        mov     x2, #s_nonjson_b_len
+        bl      .Ljappend
+
+.Llogged:
+        // Blank line so consecutive requests stay readable.
+        adrp    x1, s_nl
+        add     x1, x1, #:lo12:s_nl
+        mov     x2, #1
+        bl      .Ljappend
+        adrp    x1, jsonlog
+        add     x1, x1, #:lo12:jsonlog
+        adrp    x9, jlen
+        add     x9, x9, #:lo12:jlen
+        ldr     w2, [x9]
         bl      .Lwrite_all
 
 .Lto_send:
@@ -508,6 +679,283 @@ _start:
         subs    x2, x2, x0
         b.ne    .Lwa_loop
 .Lwa_done:
+        ret
+
+// find_clen(x1 = headers, x2 = len) -> w0 -- the Content-Length value, or 0 if
+// the header is absent. Expects CR-stripped headers, so lines end in \n.
+// Matching is case-folded with ORR 0x20, which leaves ':' and '-' alone.
+.Lfind_clen:
+        mov     x3, #0                          // index of the current line
+.Lfc_line:
+        mov     x4, #0                          // how much of the name matched
+.Lfc_cmp:
+        mov     x5, #cl_name_len
+        cmp     x4, x5
+        b.hs    .Lfc_hit
+        add     x6, x3, x4
+        cmp     x6, x2
+        b.hs    .Lfc_none                       // ran off the end mid-name
+        ldrb    w7, [x1, x6]
+        orr     w7, w7, #0x20                   // fold to lower case
+        adrp    x9, cl_name
+        add     x9, x9, #:lo12:cl_name
+        ldrb    w10, [x9, x4]
+        cmp     w7, w10
+        b.ne    .Lfc_next
+        add     x4, x4, #1
+        b       .Lfc_cmp
+
+.Lfc_hit:
+        mov     x5, #cl_name_len
+        add     x6, x3, x5
+.Lfc_space:
+        cmp     x6, x2
+        b.hs    .Lfc_none
+        ldrb    w7, [x1, x6]
+        cmp     w7, #CH_SPACE
+        b.ne    .Lfc_digits
+        add     x6, x6, #1
+        b       .Lfc_space
+.Lfc_digits:
+        mov     w0, #0
+.Lfc_digit:
+        cmp     x6, x2
+        b.hs    .Lfc_ret
+        ldrb    w7, [x1, x6]
+        sub     w7, w7, #CH_ZERO
+        cmp     w7, #9
+        b.hi    .Lfc_ret
+        mov     w9, #10
+        madd    w0, w0, w9, w7
+        add     x6, x6, #1
+        b       .Lfc_digit
+.Lfc_ret:
+        ret
+
+.Lfc_next:
+        // Skip to the start of the next line and try again.
+        cmp     x3, x2
+        b.hs    .Lfc_none
+        ldrb    w7, [x1, x3]
+        cmp     w7, #CH_LF
+        b.eq    .Lfc_advance
+        add     x3, x3, #1
+        b       .Lfc_next
+.Lfc_advance:
+        add     x3, x3, #1
+        cmp     x3, x2
+        b.hs    .Lfc_none
+        b       .Lfc_line
+
+.Lfc_none:
+        mov     w0, #0
+        ret
+
+// jappend(x1 = src, x2 = len) -- tack bytes onto jsonlog, silently truncating
+// if it would overflow. Deliberately leaves x9-x15 alone so the parser can keep
+// its cursor and token registers across a call.
+.Ljappend:
+        adrp    x3, jlen
+        add     x3, x3, #:lo12:jlen
+        ldr     w4, [x3]
+        mov     w5, #JSONLOG_MAX
+        sub     w5, w5, w4                      // space remaining
+        cmp     x2, x5
+        b.ls    .Lja_fits
+        mov     x2, x5                          // truncate
+.Lja_fits:
+        cbz     x2, .Lja_done
+        add     w6, w4, w2
+        str     w6, [x3]
+        adrp    x0, jsonlog
+        add     x0, x0, #:lo12:jsonlog
+        add     x0, x0, x4                      // dst
+.Lja_copy:
+        ldrb    w7, [x1], #1
+        strb    w7, [x0], #1
+        subs    x2, x2, #1
+        b.ne    .Lja_copy
+.Lja_done:
+        ret
+
+// json_log(x1 = body, x2 = len) -- parse a flat JSON object and append one
+// "  key = value" line per pair to jsonlog.
+//
+// Deliberately shallow: top-level scalars only, and string contents are logged
+// raw rather than unescaped, so "a\nb" appears with its backslash intact. What
+// it does handle is \" inside strings, so an escaped quote does not end a token
+// early. Anything it cannot make sense of collapses to <malformed JSON>, with
+// the half-built line rolled back so the output stays tidy.
+//
+// x9 = cursor, x10 = end, x11/x12 = current token, x13 = byte scratch,
+// x14 = scan_string error flag.
+.Ljson_log:
+        stp     x29, x30, [sp, #-16]!
+        mov     x9, x1                          // cursor
+        add     x10, x1, x2                     // end
+        bl      .Ljl_mark
+
+        bl      .Lskip_ws
+        cmp     x9, x10
+        b.hs    .Ljl_bad
+        ldrb    w13, [x9]
+        cmp     w13, #CH_LBRACE
+        b.ne    .Ljl_bad
+        add     x9, x9, #1
+        bl      .Lskip_ws
+        cmp     x9, x10
+        b.hs    .Ljl_bad
+        ldrb    w13, [x9]
+        cmp     w13, #CH_RBRACE
+        b.eq    .Ljl_done                       // {} is legal and boring
+
+.Ljl_pair:
+        bl      .Ljl_mark                       // rollback point for this line
+        bl      .Lskip_ws
+        cmp     x9, x10
+        b.hs    .Ljl_bad
+        ldrb    w13, [x9]
+        cmp     w13, #CH_QUOTE
+        b.ne    .Ljl_bad
+        bl      .Lscan_string
+        cbnz    x14, .Ljl_bad
+
+        adrp    x1, s_indent
+        add     x1, x1, #:lo12:s_indent
+        mov     x2, #s_indent_len
+        bl      .Ljappend
+        mov     x1, x11
+        mov     x2, x12
+        bl      .Ljappend
+        adrp    x1, s_eq
+        add     x1, x1, #:lo12:s_eq
+        mov     x2, #s_eq_len
+        bl      .Ljappend
+
+        bl      .Lskip_ws
+        cmp     x9, x10
+        b.hs    .Ljl_bad
+        ldrb    w13, [x9]
+        cmp     w13, #CH_COLON
+        b.ne    .Ljl_bad
+        add     x9, x9, #1
+        bl      .Lskip_ws
+        cmp     x9, x10
+        b.hs    .Ljl_bad
+
+        ldrb    w13, [x9]
+        cmp     w13, #CH_QUOTE
+        b.eq    .Ljl_vstring
+        // Bare scalar -- number, true, false, null. Runs to whitespace or to
+        // whatever punctuation ends the pair.
+        mov     x11, x9
+.Ljl_vscan:
+        cmp     x9, x10
+        b.hs    .Ljl_vend
+        ldrb    w13, [x9]
+        cmp     w13, #CH_COMMA
+        b.eq    .Ljl_vend
+        cmp     w13, #CH_RBRACE
+        b.eq    .Ljl_vend
+        cmp     w13, #CH_SPACE
+        b.ls    .Ljl_vend
+        add     x9, x9, #1
+        b       .Ljl_vscan
+.Ljl_vend:
+        sub     x12, x9, x11
+        cbz     x12, .Ljl_bad                   // ':' with nothing after it
+        b       .Ljl_vemit
+
+.Ljl_vstring:
+        bl      .Lscan_string
+        cbnz    x14, .Ljl_bad
+
+.Ljl_vemit:
+        mov     x1, x11
+        mov     x2, x12
+        bl      .Ljappend
+        adrp    x1, s_nl
+        add     x1, x1, #:lo12:s_nl
+        mov     x2, #1
+        bl      .Ljappend
+
+        bl      .Lskip_ws
+        cmp     x9, x10
+        b.hs    .Ljl_bad
+        ldrb    w13, [x9]
+        cmp     w13, #CH_COMMA
+        b.ne    .Ljl_maybe_close
+        add     x9, x9, #1
+        b       .Ljl_pair
+.Ljl_maybe_close:
+        cmp     w13, #CH_RBRACE
+        b.ne    .Ljl_bad
+
+.Ljl_done:
+        ldp     x29, x30, [sp], #16
+        ret
+
+.Ljl_bad:
+        // Throw away the partial line, then say so.
+        adrp    x15, jlinestart
+        add     x15, x15, #:lo12:jlinestart
+        ldr     w14, [x15]
+        adrp    x13, jlen
+        add     x13, x13, #:lo12:jlen
+        str     w14, [x13]
+        adrp    x1, s_bad
+        add     x1, x1, #:lo12:s_bad
+        mov     x2, #s_bad_len
+        bl      .Ljappend
+        b       .Ljl_done
+
+// Remember where this log line began, so a parse failure can roll it back.
+.Ljl_mark:
+        adrp    x13, jlen
+        add     x13, x13, #:lo12:jlen
+        ldr     w14, [x13]
+        adrp    x15, jlinestart
+        add     x15, x15, #:lo12:jlinestart
+        str     w14, [x15]
+        ret
+
+// Advance the cursor past spaces, tabs, CRs and newlines.
+.Lskip_ws:
+        cmp     x9, x10
+        b.hs    .Lsw_ret
+        ldrb    w13, [x9]
+        cmp     w13, #CH_SPACE
+        b.hi    .Lsw_ret
+        add     x9, x9, #1
+        b       .Lskip_ws
+.Lsw_ret:
+        ret
+
+// Cursor sits on the opening quote. Sets x11/x12 to the contents and leaves the
+// cursor past the closing quote. x14 nonzero if the string never closes.
+.Lscan_string:
+        mov     x14, #0
+        add     x9, x9, #1
+        mov     x11, x9
+.Lss_scan:
+        cmp     x9, x10
+        b.hs    .Lss_err
+        ldrb    w13, [x9]
+        cmp     w13, #CH_BACKSLASH
+        b.eq    .Lss_escape
+        cmp     w13, #CH_QUOTE
+        b.eq    .Lss_close
+        add     x9, x9, #1
+        b       .Lss_scan
+.Lss_escape:
+        add     x9, x9, #2
+        b       .Lss_scan
+.Lss_close:
+        sub     x12, x9, x11
+        add     x9, x9, #1
+        ret
+.Lss_err:
+        mov     x14, #1
         ret
 
 // utoa(w0 = value, x1 = dest) -- write the value in decimal, return x1 just
