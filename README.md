@@ -17,14 +17,21 @@ curl http://localhost:8080/
 
 ## How it works
 
-About 60 instructions:
+One thread, no processes, but it handles plenty of connections at once — an
+epoll loop over non-blocking sockets:
 
 ```
-socket -> bind(:8080) -> listen -> accept -> read -> send -> close -> repeat
+socket -> bind(:8080) -> listen -> epoll_create1
+   |
+   +-> epoll_pwait -> for each ready fd: accept / read / send / close
 ```
 
-One connection at a time, and every request gets the same response no matter
-the method or path.
+Every request gets the same response no matter the method or path.
+
+Each connection is really a two-state machine, and the state is just which
+event it's registered for: `EPOLLIN` while waiting for the request, `EPOLLOUT`
+while sending the reply. So there's no state variable to keep — the only thing
+worth remembering is how many bytes have gone out, in an array indexed by fd.
 
 Two things worth knowing if you poke at it:
 
@@ -33,6 +40,10 @@ Two things worth knowing if you poke at it:
 - `Content-Length` is a plain string in the source, so both files check it
   against the real body length at assembly time. Get it wrong and the build
   fails instead of clients hanging.
+
+`struct epoll_event` is packed on x86-64 (12 bytes) but not on arm64 (16), which
+is the one place the two sources genuinely differ rather than just spelling the
+same thing in different syntax.
 
 ## Two architectures?
 
