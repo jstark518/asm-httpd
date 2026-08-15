@@ -1,0 +1,18 @@
+services:
+  httpd:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: asm-httpd:latest
+    container_name: asm-httpd
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+    # The image is a single static binary and nothing else, so it can be locked
+    # down hard.
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
